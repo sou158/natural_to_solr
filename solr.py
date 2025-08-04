@@ -2,7 +2,7 @@ import os
 import uuid
 import sys
 import pdfplumber
-import docx
+from docx import Document
 import pysolr
 import google.generativeai as genai
 
@@ -10,7 +10,7 @@ import google.generativeai as genai
 genai.configure(api_key="AIzaSyDq2P1TXEzyBVHSc32FhsTDiwcR-qE25YM")  # Replace with your actual Gemini API key
 
 # ========== 2. Solr Setup ========== #
-solr = pysolr.Solr("http://localhost:8983/solr/core2", always_commit=True, timeout=10)
+solr = pysolr.Solr("http://localhost:8983/solr/core1", always_commit=True, timeout=10)
 
 
 # ========== 3. Extract Text ========== #
@@ -19,7 +19,7 @@ def extract_text(file_path: str) -> str:
         with pdfplumber.open(file_path) as pdf:
             return "\n".join(page.extract_text() or "" for page in pdf.pages)
     elif file_path.lower().endswith(".docx"):
-        doc = docx.Document(file_path)
+        doc = Document(file_path)
         return "\n".join(p.text for p in doc.paragraphs)
     else:
         raise ValueError("Unsupported file type")
