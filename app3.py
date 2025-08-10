@@ -1,26 +1,53 @@
 import streamlit as st
 import google.generativeai as genai
 import pysolr
-import pandas as pd
+from langchain.chains import LLMChain
+from langchain_core.output_parsers import StrOutputParser
+from prompt_template import get_few_shot_prompt
+from langchain.llms.base import LLM
+from typing import Optional, List
 import re
-from dateutil import parser as dateparser
 
-# --- Configure Gemini ---
-genai.configure(api_key="AIzaSyDq2P1TXEzyBVHSc32FhsTDiwcR-qE25YM")
+# ========== 1. Configure Gemini ========== #
+genai.configure(api_key="AIzaSyDq2P1TXEzyBVHSc32FhsTDiwcR-qE25YM")  # Replace with your Gemini API key
 
-# --- Solr connection ---
-SOLR_URL = "http://localhost:8983/solr/core2"
-solr = pysolr.Solr(SOLR_URL, always_commit=True, timeout=10)
+# ========== 2. Configure Solr ========== #
+solr = pysolr.Solr("http://localhost:8983/solr/core4", always_commit=True, timeout=10)
 
-# --- Fields to display ---
-solr_fields = [
-    "id", "title", "content_text",
-    "date_of_publish", "author", "brand",
-    "type", "filename"
-]
+# ========== 3. Solr Fields ========== #
+solr_fields = ["id", "title", "content_text", "author", "brand", "type", "date_of_publish"]
 
-# --- Embedding ---
-def get_embedding(text: str) -> list:
+# ========== 4. Synonym Map & Expansion ========== #
+SYNONYM_MAP = {
+    "j&j": "johnson&johnson",
+    "sop": "procedural",
+}
+
+def expand_synonyms(query: str) -> str:
+    words = query.lower().split()
+    for i, word in enumerate(words):
+        if word in SYNONYM_MAP:
+            words[i] = SYNONYM_MAP[word]
+    return " ".join(words)
+
+# ========== 5. Gemini LLM Wrapper ========== #
+class GeminiLLM(LLM):
+    model: str = "models/gemini-1.5-flash"
+    temperature: float = 0.1
+    top_p: float = 0.95
+    max_tokens: int = 512
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        model = genai.GenerativeModel(self.model)
+        response = model.generate_content(prompt)
+        return response.text.strip()
+
+    @property
+    def _llm_type(self) -> str:
+        return "google-gemini"
+
+# ========== 6. Embedding Helper ========== #
+def get_gemini_embedding(text: str) -> list:
     response = genai.embed_content(
         model="models/embedding-001",
         content=text,
@@ -28,146 +55,122 @@ def get_embedding(text: str) -> list:
     )
     return response["embedding"]
 
-# --- Rerank with Gemini ---
-def rerank_with_gemini(query, docs):
-    if not docs:
-        return []
-    items = "\n".join([f"Document {i+1}: {doc.get('content_text','')[:300]}" 
-                       for i, doc in enumerate(docs)])
+# ========== 7. Gemini-based Intent Classification ========== #
+def classify_query_type(query: str) -> str:
+    model = genai.GenerativeModel("models/gemini-1.5-flash")
     prompt = f"""
-    You are an expert search assistant.
-    Rerank these documents for relevance to the query: "{query}"
-    Documents:
-    {items}
-    Return the best document order as a JSON list of integers (indexes starting from 1).
-    """
-    model = genai.GenerativeModel("models/gemini-2.5-flash")
+You are a classifier that labels user queries as either 'keyword' or 'semantic'.
+
+Label as 'keyword' if the query:
+- Refers to specific fields (like title, author, brand, type, date_of_publish)
+- Uses terms like “created by”, “greater than”, “before”, “between”, etc.
+- Involves filtering based on fields or values
+
+Label as 'semantic' if the query:
+- Asks conceptual or natural questions (like “symptoms of depression”, “how to treat infection”)
+- Has no obvious fields or structure
+- Is vague or short with a broad intent
+
+Examples:
+
+Query: documents created by user1 in the last 30 days  
+Label: keyword
+
+Query: show documents of type procedures authored by author1  
+Label: keyword
+
+Query: symptoms of depression  
+Label: semantic
+
+Query: how to cure flu  
+Label: semantic
+
+Now classify this query:
+
+Query: {query}  
+Label:
+""".strip()
+    response = model.generate_content(prompt)
+    label = response.text.strip().lower()
+    if "semantic" in label:
+        return "semantic"
+    else:
+        return "keyword"
+
+# ========== 8. Gemini Relevance Scoring Helper ========== #
+def score_with_gemini(query: str, document_text: str) -> float:
+    model = genai.GenerativeModel("models/gemini-1.5-flash")
+    prompt = f"""
+Score the relevance of the following document to the query on a scale from 0 to 1.
+Query: {query}
+Document: {document_text}
+Score only the number, no explanation.
+"""
     response = model.generate_content(prompt)
     try:
-        order = eval(response.text.strip())
-        return [docs[i-1] for i in order if 1 <= i <= len(docs)]
-    except:
-        return docs
+        score = float(response.text.strip())
+        return max(0.0, min(1.0, score))
+    except ValueError:
+        return 0.0
 
-# --- Helper: parse date robustly ---
-def parse_date_to_solr(date_str: str) -> str:
-    try:
-        parsed_date = dateparser.parse(date_str, dayfirst=True, fuzzy=True)
-        return parsed_date.strftime("%Y-%m-%dT00:00:00Z")
-    except Exception:
-        return None
+# ========== 9. LangChain Setup ========== #
+llm = GeminiLLM()
+prompt = get_few_shot_prompt()
+chain = LLMChain(llm=llm, prompt=prompt, output_parser=StrOutputParser())
 
-# --- Build Solr query from user query ---
-def build_solr_query(user_query: str) -> str:
-    q = []
+# ========== 10. Streamlit UI ========== #
+st.set_page_config(page_title="Solr + Gemini Semantic Search", layout="centered")
+st.title("🔍 Solr + Gemini: Smart Search Assistant")
 
-    # --- Detect brand ---
-    brand_match = re.search(r'brand\s+(?:is|=)?\s*"?([\w\s]+)"?', user_query, re.I)
-    if brand_match:
-        q.append(f'Brand:"{brand_match.group(1)}"')
+st.markdown("Enter a natural language query. The app will auto-detect if it should use keyword or semantic search.")
 
-    # --- Detect author ---
-    author_match = re.search(r'author\s+(?:is|=|by)?\s*"?([\w\s]+)"?', user_query, re.I)
-    if author_match:
-        q.append(f'Author:"{author_match.group(1)}"')
+with st.expander("🧾 View Solr Fields"):
+    st.code(", ".join(solr_fields))
 
-    # --- Detect type ---
-    type_match = re.search(r'type\s+(?:is|=)?\s*"?([\w\s]+)"?', user_query, re.I)
-    if type_match:
-        q.append(f'Type:"{type_match.group(1)}"')
+raw_query = st.text_input("💬 Your Query:", placeholder="e.g. Show documents of type procedures OR Symptoms of depression")
+user_query = expand_synonyms(raw_query)
 
-    # --- Detect filename ---
-    filename_match = re.search(r'filename\s+(?:is|=)?\s*"?([\w\-.]+)"?', user_query, re.I)
-    if filename_match:
-        q.append(f'filename:"{filename_match.group(1)}"')
-
-    # --- Detect "before" date ---
-    before_match = re.search(r'before\s+([\w\d\s,/-]+)', user_query, re.I)
-    if before_match:
-        solr_date = parse_date_to_solr(before_match.group(1))
-        if solr_date:
-            q.append(f'Date_of_publish:[* TO {solr_date}]')
-
-    # --- Detect "after" date ---
-    after_match = re.search(r'after\s+([\w\d\s,/-]+)', user_query, re.I)
-    if after_match:
-        solr_date = parse_date_to_solr(after_match.group(1))
-        if solr_date:
-            q.append(f'Date_of_publish:[{solr_date} TO NOW]')
-
-    # --- Detect "last X days" ---
-    last_days_match = re.search(r'last\s+(\d+)\s+days', user_query, re.I)
-    if last_days_match:
-        days = last_days_match.group(1)
-        q.append(f'Date_of_publish:[NOW-{days}DAYS TO NOW]')
-
-    # --- Detect content phrase search ---
-    content_match = re.search(r'content\s+(?:has|contains|with)?\s*"?([\w\s]+)"?', user_query, re.I)
-    if content_match:
-        q.append(f'content_text:"{content_match.group(1)}"')
-
-    # --- If no explicit filter, search across multiple fields ---
-    if not q:
-        q.append(f'(title:({user_query}) OR content_text:({user_query}) OR '
-                 f'author:({user_query}) OR brand:({user_query}) OR '
-                 f'type:({user_query}) OR filename:({user_query}))')
-
-    return " AND ".join(q)
-
-# --- Streamlit UI ---
-st.set_page_config(page_title="Hybrid Search (Gemini + Solr)", layout="centered")
-st.title("🔎 Hybrid Search with Improved Date Parsing")
-
-user_query = st.text_input("💬 Your Question:", placeholder='e.g. documents of type procedures created by author1 before 21st July 2025')
-use_rerank = st.checkbox("Use Gemini Reranking", value=True)
-
-if st.button("Search") and user_query.strip():
-    with st.spinner("Searching..."):
+if st.button("Generate & Search") and user_query.strip():
+    with st.spinner("Detecting intent with Gemini and querying Solr..."):
         try:
-            # Get embedding
-            embedding = get_embedding(user_query)
-            embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+            query_type = classify_query_type(user_query).capitalize()
+            st.info(f"🔍 Detected Query Type (via Gemini): **{query_type} Search**")
 
-            # Build query
-            solr_query = build_solr_query(user_query)
-            st.write(f"**Solr Query Executed:** `{solr_query}`")
+            if query_type == "Keyword":
+                solr_query = chain.run({
+                    "user_query": user_query,
+                    "fields": ", ".join(solr_fields)
+                }).strip()
+                st.success("✅ Generated Solr Query:")
+                st.code(solr_query)
+                results = solr.search(solr_query)
 
-            # Hybrid search (embedding + keyword)
-            semantic_results = solr.search(solr_query, **{
-                "defType": "edismax",
-                "qf": "content_text^2 title author brand type filename",
-                "knn": f"{{!knn f=content_embedding topK=10}}{embedding_str}",
-                "fl": "*,score",
-                "rows": 10,
-                "mm": "1<50%"
-            })
-
-            # Fallback to keyword only
-            results = semantic_results if len(semantic_results) > 0 else solr.search(
-                solr_query,
-                **{
-                    "defType": "edismax",
-                    "qf": "content_text^2 title author brand type filename",
-                    "fl": "*,score",
-                    "rows": 10,
-                    "mm": "1<50%"
-                }
-            )
-
-            # Score filtering
-            filtered_results = [doc for doc in results if float(doc.get("score", 0)) > 0.6]
-
-            # Gemini Reranking
-            if use_rerank and filtered_results:
-                filtered_results = rerank_with_gemini(user_query, filtered_results)
-
-            # Display results
-            if filtered_results:
-                docs = [{field: doc.get(field, "") for field in solr_fields} for doc in filtered_results]
-                st.success(f"Found {len(filtered_results)} relevant results")
-                st.dataframe(pd.DataFrame(docs), use_container_width=True)
             else:
-                st.warning("No relevant results found.")
+                embedding = get_gemini_embedding(user_query)
+                vector_str = "[" + ",".join(map(str, embedding)) + "]"
+                solr_query = f"{{!knn f=content_embedding topK=5}}{vector_str}"
+                st.success("✅ Semantic Vector Query:")
+                st.code(solr_query)
+                results = solr.search(solr_query)
+
+                scored_docs = []
+                for doc in results:
+                    doc_text = f"{doc.get('title', '')} {doc.get('content_text', '')}"
+                    score = score_with_gemini(user_query, doc_text)
+                    if score > 0.7:
+                        filtered_doc = {field: doc.get(field, "") for field in solr_fields}
+                        filtered_doc["score"] = score
+                        scored_docs.append(filtered_doc)
+
+                scored_docs.sort(key=lambda x: x["score"], reverse=True)
+                results = scored_docs
+
+            st.markdown(f"### 📄 Found {len(results)} result(s):")
+            if results:
+                st.dataframe(results, use_container_width=True)
+            else:
+                st.warning("No results found.")
 
         except Exception as e:
-            st.error(f"Error: {str(e)}")
+            st.error(f"❌ Error: {str(e)}")
+
