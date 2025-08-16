@@ -9,10 +9,10 @@ from typing import Optional, List
 import re
 
 # ========== 1. Configure Gemini ========== #
-genai.configure(api_key="AIzaSyDq2P1TXEzyBVHSc32FhsTDiwcR-qE25YM")  # Replace with your Gemini API key
+genai.configure(api_key="AIzaSyB1P-eb7w73RVyVpJ0ygLm6rB-2PR6vgUM")  # Replace with your Gemini API key
 
 # ========== 2. Configure Solr ========== #
-solr = pysolr.Solr("http://localhost:8983/solr/core1", always_commit=True, timeout=10)
+solr = pysolr.Solr("http://localhost:8983/solr/core4", always_commit=True, timeout=10)
 
 # ========== 3. Solr Fields ========== #
 solr_fields = ["id", "title", "content_text", "author", "brand", "type", "date_of_publish"]
@@ -29,6 +29,7 @@ def expand_synonyms(query: str) -> str:
         if word in SYNONYM_MAP:
             words[i] = SYNONYM_MAP[word]
     return " ".join(words)
+
 
 # ========== 5. Gemini LLM Wrapper ========== #
 class GeminiLLM(LLM):
@@ -131,94 +132,45 @@ raw_query = st.text_input("💬 Your Query:", placeholder="e.g. Show documents o
 user_query = expand_synonyms(raw_query)
 
 if st.button("Generate & Search") and user_query.strip():
-
-    with st.spinner("Running keyword, semantic, then hybrid search if needed..."):
+    with st.spinner("Detecting intent with Gemini and querying Solr..."):
         try:
-            # --- Keyword Search ---
-            keyword_query = chain.run({
-                "user_query": user_query,
-                "fields": ", ".join(solr_fields)
-            }).strip()
-            st.info("🔍 Keyword Search Query:")
-            st.code(keyword_query)
-            keyword_results = list(solr.search(keyword_query, rows=10))
+            query_type = classify_query_type(user_query).capitalize()
+            st.info(f"🔍 Detected Query Type (via Gemini): **{query_type} Search**")
 
-            if keyword_results:
-                st.markdown(f"### 📄 Found {len(keyword_results)} result(s) with Keyword Search:")
-                scored_docs = []
-                for doc in keyword_results:
-                    doc_text = f"{doc.get('title', '')} {doc.get('content_text', '')}"
-                    score = score_with_gemini(user_query, doc_text)
-                    filtered_doc = {field: doc.get(field, "") for field in solr_fields}
-                    filtered_doc["score"] = score
-                    scored_docs.append(filtered_doc)
-                scored_docs.sort(key=lambda x: x["score"], reverse=True)
-                import pandas as pd
-                df = pd.DataFrame(scored_docs)
-                if not df.empty:
-                    st.dataframe(df, use_container_width=True)
-                    if any(d["score"] <= 0.2 for d in scored_docs):
-                        st.warning("Some results have low relevance scores (≤ 0.2).")
-                else:
-                    st.warning("No results found.")
+            if query_type == "Keyword":
+                solr_query = chain.run({
+                    "user_query": user_query,
+                    "fields": ", ".join(solr_fields)
+                }).strip()
+                st.success("✅ Generated Solr Query:")
+                st.code(solr_query)
+                results = solr.search(solr_query)
+
             else:
-                # --- Semantic Search ---
                 embedding = get_gemini_embedding(user_query)
                 vector_str = "[" + ",".join(map(str, embedding)) + "]"
-                semantic_query = f"{{!knn f=content_embedding topK=10}}{vector_str}"
-                st.info("🔍 Semantic Vector Query:")
-                st.code(semantic_query)
-                semantic_results = list(solr.search(semantic_query, rows=10))
+                solr_query = f"{{!knn f=content_embedding topK=5}}{vector_str}"
+                st.success("✅ Semantic Vector Query:")
+                st.code(solr_query)
+                results = solr.search(solr_query)
 
-                if semantic_results:
-                    st.markdown(f"### 📄 Found {len(semantic_results)} result(s) with Semantic Search:")
-                    scored_docs = []
-                    for doc in semantic_results:
-                        doc_text = f"{doc.get('title', '')} {doc.get('content_text', '')}"
-                        score = score_with_gemini(user_query, doc_text)
+                scored_docs = []
+                for doc in results:
+                    doc_text = f"{doc.get('title', '')} {doc.get('content_text', '')}"
+                    score = score_with_gemini(user_query, doc_text)
+                    if score > 0.7:
                         filtered_doc = {field: doc.get(field, "") for field in solr_fields}
                         filtered_doc["score"] = score
                         scored_docs.append(filtered_doc)
-                    scored_docs = [d for d in scored_docs if d["score"] > 0.2]
-                    scored_docs.sort(key=lambda x: x["score"], reverse=True)
-                    import pandas as pd
-                    df = pd.DataFrame(scored_docs)
-                    if not df.empty:
-                        st.dataframe(df, use_container_width=True)
-                    else:
-                        st.warning("No results found.")
-                else:
-                    # --- Hybrid Search ---
-                    st.info("🔍 No results from keyword or semantic search. Running hybrid search...")
-                    docs_by_id = {}
-                    # Run both searches again to merge
-                    all_results = list(solr.search(keyword_query, rows=10)) + list(solr.search(semantic_query, rows=10))
-                    for doc in all_results:
-                        doc_id = doc.get("id")
-                        if doc_id and doc_id not in docs_by_id:
-                            docs_by_id[doc_id] = doc
-                    merged_results = list(docs_by_id.values())
-                    scored_docs = []
-                    for doc in merged_results:
-                        doc_text = f"{doc.get('title', '')} {doc.get('content_text', '')}"
-                        score = score_with_gemini(user_query, doc_text)
-                        filtered_doc = {field: doc.get(field, "") for field in solr_fields}
-                        filtered_doc["score"] = score
-                        scored_docs.append(filtered_doc)
-                    scored_docs = [d for d in scored_docs if d["score"] > 0.2]
-                    scored_docs.sort(key=lambda x: x["score"], reverse=True)
-                    st.markdown(f"### 📄 Found {len(scored_docs)} result(s) with Hybrid Search:")
-                    if scored_docs:
-                        import pandas as pd
-                        df = pd.DataFrame(scored_docs)
-                        if not df.empty:
-                            st.dataframe(df, use_container_width=True)
-                        else:
-                            st.warning("No results found.")
-                    else:
-                        st.warning("No results found.")
+
+                scored_docs.sort(key=lambda x: x["score"], reverse=True)
+                results = scored_docs
+
+            st.markdown(f"### 📄 Found {len(results)} result(s):")
+            if results:
+                st.dataframe(results, use_container_width=True)
+            else:
+                st.warning("No results found.")
 
         except Exception as e:
             st.error(f"❌ Error: {str(e)}")
-
-
