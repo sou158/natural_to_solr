@@ -6,9 +6,10 @@ from langchain_core.output_parsers import StrOutputParser
 from prompt_template import get_few_shot_prompt
 from langchain.llms.base import LLM
 from typing import Optional, List
+import re
 
 # ========== 1. Configure Gemini ========== #
-genai.configure(api_key="AIzaSyDq2P1TXEzyBVHSc32FhsTDiwcR-qE25YM")  # 🔁 Replace with your Gemini API key
+genai.configure(api_key="AIzaSyB1P-eb7w73RVyVpJ0ygLm6rB-2PR6vgUM")
 
 # ========== 2. Configure Solr ========== #
 solr = pysolr.Solr("http://localhost:8983/solr/core4", always_commit=True, timeout=10)
@@ -16,7 +17,20 @@ solr = pysolr.Solr("http://localhost:8983/solr/core4", always_commit=True, timeo
 # ========== 3. Solr Fields ========== #
 solr_fields = ["id", "title", "content_text", "author", "brand", "type", "date_of_publish"]
 
-# ========== 4. Gemini LLM Wrapper ========== #
+# ========== 4. Synonym Map & Expansion ========== #
+SYNONYM_MAP = {
+    "j&j": "johnson&johnson",
+    "sop": "procedural",
+}
+
+def expand_synonyms(query: str) -> str:
+    words = query.lower().split()
+    for i, word in enumerate(words):
+        if word in SYNONYM_MAP:
+            words[i] = SYNONYM_MAP[word]
+    return " ".join(words)
+
+# ========== 5. Gemini LLM Wrapper ========== #
 class GeminiLLM(LLM):
     model: str = "models/gemini-1.5-flash"
     temperature: float = 0.1
@@ -32,13 +46,16 @@ class GeminiLLM(LLM):
     def _llm_type(self) -> str:
         return "google-gemini"
 
-# ========== 5. Embedding Helper ========== #
-def get_gemini_embedding(text: str) -> List[float]:
-    model = genai.GenerativeModel("models/embedding-001")
-    res = model.embed_content(content=text, task_type="retrieval_document")
-    return res["embedding"]
+# ========== 6. Embedding Helper ========== #
+def get_gemini_embedding(text: str) -> list:
+    response = genai.embed_content(
+        model="models/embedding-001",
+        content=text,
+        task_type="semantic_similarity"
+    )
+    return response["embedding"]
 
-# ========== 6. Gemini-based Intent Classification ========== #
+# ========== 7. Gemini-based Intent Classification ========== #
 def classify_query_type(query: str) -> str:
     model = genai.GenerativeModel("models/gemini-1.5-flash")
     prompt = f"""
@@ -68,6 +85,7 @@ Label: semantic
 Query: how to cure flu  
 Label: semantic
 
+
 Now classify this query:
 
 Query: {query}  
@@ -80,12 +98,28 @@ Label:
     else:
         return "keyword"
 
-# ========== 7. LangChain Setup ========== #
+# ========== 8. Gemini Relevance Scoring Helper ========== #
+def score_with_gemini(query: str, document_text: str) -> float:
+    model = genai.GenerativeModel("models/gemini-1.5-flash")
+    prompt = f"""
+Score the relevance of the following document to the query on a scale from 0 to 1.
+Query: {query}
+Document: {document_text}
+Score only the number, no explanation.
+"""
+    response = model.generate_content(prompt)
+    try:
+        score = float(response.text.strip())
+        return max(0.0, min(1.0, score))
+    except ValueError:
+        return 0.0
+
+# ========== 9. LangChain Setup ========== #
 llm = GeminiLLM()
 prompt = get_few_shot_prompt()
 chain = LLMChain(llm=llm, prompt=prompt, output_parser=StrOutputParser())
 
-# ========== 8. Streamlit UI ========== #
+# ========== 10. Streamlit UI ========== #
 st.set_page_config(page_title="Solr + Gemini Semantic Search", layout="centered")
 st.title("🔍 Solr + Gemini: Smart Search Assistant")
 
@@ -94,14 +128,15 @@ st.markdown("Enter a natural language query. The app will auto-detect if it shou
 with st.expander("🧾 View Solr Fields"):
     st.code(", ".join(solr_fields))
 
-user_query = st.text_input("💬 Your Query:", placeholder="e.g. Show documents of type procedures OR Symptoms of depression")
+raw_query = st.text_input("💬 Your Query:", placeholder="e.g. Show documents of type procedures OR Symptoms of depression")
+user_query = expand_synonyms(raw_query)
 
 if st.button("Generate & Search") and user_query.strip():
     with st.spinner("Detecting intent with Gemini and querying Solr..."):
         try:
             query_type = classify_query_type(user_query).capitalize()
             st.info(f"🔍 Detected Query Type (via Gemini): **{query_type} Search**")
-
+            results = []
             if query_type == "Keyword":
                 solr_query = chain.run({
                     "user_query": user_query,
@@ -111,7 +146,7 @@ if st.button("Generate & Search") and user_query.strip():
                 st.code(solr_query)
                 results = solr.search(solr_query)
 
-            else:
+            elif query_type == "Semantic":
                 embedding = get_gemini_embedding(user_query)
                 vector_str = "[" + ",".join(map(str, embedding)) + "]"
                 solr_query = f"{{!knn f=content_embedding topK=5}}{vector_str}"
@@ -119,10 +154,39 @@ if st.button("Generate & Search") and user_query.strip():
                 st.code(solr_query)
                 results = solr.search(solr_query)
 
+                scored_docs = []
+                for doc in results:
+                    doc_text = f"{doc.get('title', '')} {doc.get('content_text', '')}"
+                    score = score_with_gemini(user_query, doc_text)
+                    if score > 0.7:
+                        filtered_doc = {field: doc.get(field, "") for field in solr_fields}
+                        filtered_doc["score"] = score
+                        scored_docs.append(filtered_doc)
+
+                scored_docs.sort(key=lambda x: x["score"], reverse=True)
+                results = scored_docs
+
+                # Build context for RAG
+                if results:
+                    context = "\n\n".join([doc.get("content_text", "") for doc in results[:3]])
+                    rag_prompt = f"""
+You are an assistant. Answer the following question using only the provided documents.
+
+Question: {user_query}
+
+Documents:
+{context}
+
+Answer:
+""".strip()
+                    model = genai.GenerativeModel("models/gemini-1.5-flash")
+                    rag_response = model.generate_content(rag_prompt)
+                    st.markdown("### 🤖 LLM Answer:")
+                    st.write(rag_response.text.strip())
+
             st.markdown(f"### 📄 Found {len(results)} result(s):")
             if results:
-                docs = [{field: doc.get(field, "") for field in solr_fields} for doc in results]
-                st.dataframe(docs, use_container_width=True)
+                st.dataframe(results, use_container_width=True)
             else:
                 st.warning("No results found.")
 
