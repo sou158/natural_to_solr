@@ -4,13 +4,24 @@ import sys
 import pdfplumber
 import docx
 import pysolr
-import google.generativeai as genai
+from datetime import datetime
+from openai import AzureOpenAI
 
-# ========== 1. Configure Gemini ========== #
-genai.configure(api_key="AIzaSyDq2P1TXEzyBVHSc32FhsTDiwcR-qE25YM")  # Replace with your actual Gemini API key
+# ========== 1. Configure Azure OpenAI ========== #
+# Make sure these environment variables are set or replace them with hardcoded values
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://<your-resource-name>.openai.azure.com/")
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "<your-key>")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "text-embedding-3-large")  
+# Replace with your deployment name (for text-embedding-3-small or text-embedding-3-large)
+
+client = AzureOpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    api_version="2023-05-15",
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
 
 # ========== 2. Solr Setup ========== #
-solr = pysolr.Solr("http://localhost:8983/solr/core2", always_commit=True, timeout=10)
+solr = pysolr.Solr("http://localhost:8983/solr/core5", always_commit=True, timeout=10)
 
 
 # ========== 3. Extract Text ========== #
@@ -24,22 +35,21 @@ def extract_text(file_path: str) -> str:
     else:
         raise ValueError("Unsupported file type")
 
-# ========== 4. Get Embedding from Gemini ========== #
+
+# ========== 4. Get Embedding from Azure OpenAI ========== #
 def get_embedding(text: str) -> list:
-    response = genai.embed_content(
-        model="models/embedding-001",
-        content=text[:3000],
-        task_type="semantic_similarity"
+    # Truncate text to avoid exceeding token limits
+    truncated_text = text[:3000]
+
+    response = client.embeddings.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        input=truncated_text
     )
-    # handle both possible formats
-    embedding = response.get("embedding", [])
-    if isinstance(embedding, dict) and "values" in embedding:
-        return embedding["values"]
-    return embedding
+
+    return response.data[0].embedding
 
 
-
-# ========== 5. Upload a Single File ========== #
+# ========== 5. Upload a Single File with Extra Fields ========== #
 def upload_document(file_path: str):
     print(f"📄 Processing: {file_path}")
     try:
@@ -50,46 +60,43 @@ def upload_document(file_path: str):
 
         embedding = get_embedding(content_text)
 
-        print(type(embedding), len(embedding))
-        print(embedding[:10])
+        # --- Manually enter metadata fields ---
+        author = input("Enter Author name (or leave blank): ").strip() or "Unknown"
+        brand = input("Enter Brand (or leave blank): ").strip() or "Unknown"
+        doc_type = input("Enter Document Type (or leave blank): ").strip() or "General"
+        date_input = input("Enter Date of Publish (YYYY-MM-DD) (or leave blank for today): ").strip()
+        if date_input:
+            try:
+                date_of_publish = datetime.strptime(date_input, "%Y-%m-%d").strftime("%Y-%m-%dT00:00:00Z")
+            except ValueError:
+                print("⚠️ Invalid date format. Using today's date instead.")
+                date_of_publish = datetime.utcnow().strftime("%Y-%m-%dT00:00:00Z")
+        else:
+            date_of_publish = datetime.utcnow().strftime("%Y-%m-%dT00:00:00Z")
 
+        # --- Solr Document ---
         doc = {
             "id": str(uuid.uuid4()),
             "title": os.path.basename(file_path),
             "content_text": content_text,
-            "content_embedding": embedding
+            "content_embedding": embedding,
+            "author": author,
+            "brand": brand,
+            "type": doc_type,
+            "date_of_publish": date_of_publish
         }
 
         solr.add([doc])
-        print("✅ Uploaded.")
+        print("✅ Uploaded with additional metadata.")
+
     except Exception as e:
         print(f"❌ Failed to upload {file_path}: {e}")
 
-# ========== 6. Upload All Files in Folder ========== #
-# def upload_folder(folder_path: str):
-#     if not os.path.isdir(folder_path):
-#         print("❌ Invalid folder path.")
-#         return
 
-#     supported_ext = [".pdf", ".docx"]
-#     files = [
-#         os.path.join(folder_path, f)
-#         for f in os.listdir(folder_path)
-#         if f.lower().endswith(tuple(supported_ext))
-#     ]
-
-#     if not files:
-#         print("📂 No supported files found in folder.")
-#         return
-
-#     print(f"📁 Found {len(files)} files. Uploading...")
-#     for file_path in files:
-#         upload_document(file_path)
-
-# ========== 7. Entry Point ========== #
+# ========== 6. Entry Point ========== #
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python upload_folder_to_solr.py path/to/folder")
+        print("Usage: python upload_folder_to_solr.py path/to/file")
         sys.exit(1)
 
     upload_document(sys.argv[1])
