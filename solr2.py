@@ -4,14 +4,24 @@ import sys
 import pdfplumber
 import docx
 import pysolr
-import google.generativeai as genai
 from datetime import datetime
+from openai import AzureOpenAI
 
-# ========== 1. Configure Gemini ========== #
-genai.configure(api_key="AIzaSyDq2P1TXEzyBVHSc32FhsTDiwcR-qE25YM")  # Replace with your actual Gemini API key
+# ========== 1. Configure Azure OpenAI ========== #
+# Make sure these environment variables are set or replace them with hardcoded values
+AZURE_OPENAI_ENDPOINT =  "https://azdtapimanager.azure-api.net/newllm/deployments/dt_trial_text-embedding-3-large/embeddings?api-version=2023-05-15"
+AZURE_OPENAI_KEY =  "280ea43fe4674b42adfaa2bddbe45d9f"
+AZURE_OPENAI_DEPLOYMENT = "text-embedding-3-large"
+# Replace with your deployment name (for text-embedding-3-small or text-embedding-3-large)
+
+client = AzureOpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    api_version="2023-05-15",
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
 
 # ========== 2. Solr Setup ========== #
-solr = pysolr.Solr("http://localhost:8983/solr/core2", always_commit=True, timeout=10)
+solr = pysolr.Solr("http://localhost:8983/solr/core6", always_commit=True, timeout=10)
 
 
 # ========== 3. Extract Text ========== #
@@ -26,17 +36,17 @@ def extract_text(file_path: str) -> str:
         raise ValueError("Unsupported file type")
 
 
-# ========== 4. Get Embedding from Gemini ========== #
+# ========== 4. Get Embedding from Azure OpenAI ========== #
 def get_embedding(text: str) -> list:
-    response = genai.embed_content(
-        model="models/embedding-001",
-        content=text[:3000],
-        task_type="semantic_similarity"
+    # Truncate text to avoid exceeding token limits
+    truncated_text = text[:3000]
+
+    response = client.embeddings.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        input=truncated_text
     )
-    embedding = response.get("embedding", [])
-    if isinstance(embedding, dict) and "values" in embedding:
-        return embedding["values"]
-    return embedding
+
+    return response.data[0].embedding
 
 
 # ========== 5. Upload a Single File with Extra Fields ========== #
@@ -57,7 +67,6 @@ def upload_document(file_path: str):
         date_input = input("Enter Date of Publish (YYYY-MM-DD) (or leave blank for today): ").strip()
         if date_input:
             try:
-                # Validate and format date
                 date_of_publish = datetime.strptime(date_input, "%Y-%m-%d").strftime("%Y-%m-%dT00:00:00Z")
             except ValueError:
                 print("⚠️ Invalid date format. Using today's date instead.")
