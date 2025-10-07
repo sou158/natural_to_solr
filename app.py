@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+from openai import AzureOpenAI
 import pysolr
 from langchain.chains import LLMChain
 from langchain_core.output_parsers import StrOutputParser
@@ -7,15 +7,23 @@ from prompt_template import get_few_shot_prompt
 from langchain.llms.base import LLM
 from typing import Optional, List
 import re
+import os
 
-# ========== 1. Configure Gemini ========== #
-genai.configure(api_key="AIzaSyDq2P1TXEzyBVHSc32FhsTDiwcR-qE25YM")  # Replace with your Gemini API key
+# ========== 1. Configure Azure OpenAI ========== #
+client = AzureOpenAI(
+    api_key="280ea43fe4674b42adfaa2bddbe45d9f", 
+    azure_endpoint="https://azdtapimanager.azure-api.net/newllm/deployments/dt_trial_gpt-4o/chat/completions?api-version=2024-08-01-preview",
+    api_version="2024-08-01-preview"
+)
+
+AZURE_CHAT_MODEL = "gpt-4o"              # Replace with your deployed chat model
+AZURE_EMBED_MODEL = "text-embedding-3-large"  # Replace with your deployed embedding model
 
 # ========== 2. Configure Solr ========== #
-solr = pysolr.Solr("http://localhost:8983/solr/core4", always_commit=True, timeout=10)
+solr = pysolr.Solr("http://localhost:8983/solr/core6", always_commit=True, timeout=10)
 
 # ========== 3. Solr Fields ========== #
-solr_fields = ["id", "title", "content_text", "author", "brand", "type", "date_of_publish"]
+solr_fields = ["id", "title", "content_text", "author", "brand", "type", "date_of_publish","content_embedding"]
 
 # ========== 4. Synonym Map & Expansion ========== #
 SYNONYM_MAP = {
@@ -30,112 +38,107 @@ def expand_synonyms(query: str) -> str:
             words[i] = SYNONYM_MAP[word]
     return " ".join(words)
 
-# ========== 5. Gemini LLM Wrapper ========== #
-class GeminiLLM(LLM):
-    model: str = "models/gemini-1.5-flash"
+# ========== 5. Azure OpenAI LLM Wrapper (LangChain-Compatible) ========== #
+class AzureOpenAILLM(LLM):
+    model: str = AZURE_CHAT_MODEL
     temperature: float = 0.1
     top_p: float = 0.95
     max_tokens: int = 512
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
-        model = genai.GenerativeModel(self.model)
-        response = model.generate_content(prompt)
-        return response.text.strip()
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            top_p=self.top_p
+        )
+        return response.choices[0].message.content.strip()
 
     @property
     def _llm_type(self) -> str:
-        return "google-gemini"
+        return "azure-openai"
 
 # ========== 6. Embedding Helper ========== #
-def get_gemini_embedding(text: str) -> list:
-    response = genai.embed_content(
-        model="models/embedding-001",
-        content=text,
-        task_type="semantic_similarity"
+def get_azure_embedding(text: str) -> list:
+    response = client.embeddings.create(
+        model=AZURE_EMBED_MODEL,
+        input=text
     )
-    return response["embedding"]
+    return response.data[0].embedding
 
-# ========== 7. Gemini-based Intent Classification ========== #
+# ========== 7. Query Classification ========== #
 def classify_query_type(query: str) -> str:
-    model = genai.GenerativeModel("models/gemini-1.5-flash")
     prompt = f"""
-You are a classifier that labels user queries as either 'keyword', 'semantic', or 'hybrid'.
+You are a classifier that labels user queries as either 'keyword' or 'semantic'.
 
 Label as 'keyword' if the query:
-- Refers only to specific fields (like title, author, brand, type, date_of_publish)
+- Refers to specific fields (like title, author, brand, type, date_of_publish)
 - Uses terms like “created by”, “greater than”, “before”, “between”, etc.
+- Involves filtering based on fields or values
 
 Label as 'semantic' if the query:
-- Asks conceptual or natural questions (like “symptoms of depression”, “how to treat infection”)
+- Asks conceptual or natural questions (like “percentage of alcohol in sanitizers”, “how to treat infections”,"work ID for task A")
 - Has no obvious fields or structure
-
-Label as 'hybrid' if the query:
-- Combines field-based filters with conceptual or vague language
-- Example: “procedures by author1 about infection”
+- Is vague or short with a broad intent
 
 Examples:
 
-Query: documents created by user1 in the last 30 days  
+q: documents created by user1 in the last 30 days  
 Label: keyword
 
-Query: symptoms of depression  
-Label: semantic
-
-Query: procedures by author1 about infection  
-Label: hybrid
-
-Query: show documents of type procedures authored by author1  
+q: show documents of type procedures authored by author1  
 Label: keyword
 
-Query: symptoms of depression  
+q: what is the work id of conduct security audit  
 Label: semantic
 
-Query: how to cure flu  
+q: percentage of cotton in baby wipes  
 Label: semantic
-
-Query:Show documents about covid-19 by author2
-Label:Hybrid
 
 Now classify this query:
-
-Query: {query}  
+Query: {query}
 Label:
 """.strip()
-    response = model.generate_content(prompt)
-    label = response.text.strip().lower()
-    if "semantic" in label:
-        return "semantic"
-    elif "hybrid" in label:
-        return "hybrid"
-    else:
-        return "keyword"
 
-# ========== 8. Gemini Relevance Scoring Helper ========== #
-def score_with_gemini(query: str, document_text: str) -> float:
-    model = genai.GenerativeModel("models/gemini-1.5-flash")
+    response = client.chat.completions.create(
+        model=AZURE_CHAT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+    label = response.choices[0].message.content.strip().lower()
+    return "semantic" if "semantic" in label else "keyword"
+
+# ========== 8. Relevance Scoring ========== #
+def score_with_azure(query: str, document_text: str) -> float:
     prompt = f"""
 Score the relevance of the following document to the query on a scale from 0 to 1.
 Query: {query}
 Document: {document_text}
 Score only the number, no explanation.
-"""
-    response = model.generate_content(prompt)
+""".strip()
+
+    response = client.chat.completions.create(
+        model=AZURE_CHAT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
     try:
-        score = float(response.text.strip())
+        score = float(response.choices[0].message.content.strip())
         return max(0.0, min(1.0, score))
     except ValueError:
         return 0.0
 
 # ========== 9. LangChain Setup ========== #
-llm = GeminiLLM()
+llm = AzureOpenAILLM()
 prompt = get_few_shot_prompt()
 chain = LLMChain(llm=llm, prompt=prompt, output_parser=StrOutputParser())
 
 # ========== 10. Streamlit UI ========== #
-st.set_page_config(page_title="Solr + Gemini Semantic Search", layout="centered")
-st.title("🔍 Solr + Gemini: Smart Search Assistant")
+st.set_page_config(page_title="Solr + Azure OpenAI Semantic Search", layout="centered")
+st.title("🔍 Solr + Azure OpenAI: Smart Search Assistant")
 
-st.markdown("Enter a natural language query. The app will auto-detect if it should use keyword, semantic, or hybrid search.")
+st.markdown("Enter a natural language query. The app will auto-detect if it should use keyword or semantic search.")
 
 with st.expander("🧾 View Solr Fields"):
     st.code(", ".join(solr_fields))
@@ -144,32 +147,41 @@ raw_query = st.text_input("💬 Your Query:", placeholder="e.g. Show documents o
 user_query = expand_synonyms(raw_query)
 
 if st.button("Generate & Search") and user_query.strip():
-    with st.spinner("Detecting intent with Gemini and querying Solr..."):
+    with st.spinner("Detecting intent with Azure OpenAI and querying Solr..."):
         try:
             query_type = classify_query_type(user_query).capitalize()
-            st.info(f"🔍 Detected Query Type (via Gemini): **{query_type} Search**")
+            st.info(f"🔍 Detected Query Type (via Azure OpenAI): **{query_type} Search**")
 
+            results = []
             if query_type == "Keyword":
                 solr_query = chain.run({
                     "user_query": user_query,
                     "fields": ", ".join(solr_fields)
                 }).strip()
+                if solr_query.lower().startswith("solr query:"):
+                    solr_query = solr_query.split(":", 1)[1].strip()
+
                 st.success("✅ Generated Solr Query:")
                 st.code(solr_query)
-                results = solr.search(solr_query)
+                results = solr.search(q=solr_query)
 
             elif query_type == "Semantic":
-                embedding = get_gemini_embedding(user_query)
-                vector_str = "[" + ",".join(map(str, embedding)) + "]"
+                embedding = get_azure_embedding(user_query)
+# Convert embedding to a comma-separated string WITHOUT brackets
+                vector_str = ",".join(map(str, embedding))
+# Use the {!knn} syntax
                 solr_query = f"{{!knn f=content_embedding topK=5}}{vector_str}"
-                st.success("✅ Semantic Vector Query:")
-                st.code(solr_query)
-                results = solr.search(solr_query)
+
+# Use Solr parameters to ensure correct type
+                results = solr.search(solr_query, **{
+                    "fl": ",".join(solr_fields),
+                    "rows": 5
+                })
 
                 scored_docs = []
                 for doc in results:
                     doc_text = f"{doc.get('title', '')} {doc.get('content_text', '')}"
-                    score = score_with_gemini(user_query, doc_text)
+                    score = score_with_azure(user_query, doc_text)
                     if score > 0.7:
                         filtered_doc = {field: doc.get(field, "") for field in solr_fields}
                         filtered_doc["score"] = score
@@ -178,36 +190,28 @@ if st.button("Generate & Search") and user_query.strip():
                 scored_docs.sort(key=lambda x: x["score"], reverse=True)
                 results = scored_docs
 
-            elif query_type == "Hybrid":
-                keyword_query = chain.run({
-                    "user_query": user_query,
-                    "fields": ", ".join(solr_fields)
-                }).strip()
-                st.success("✅ Keyword Filter Query:")
-                st.code(keyword_query)
+                # Build context for RAG
+                if results:
+                    context = "\n\n".join([doc.get("content_text", "") for doc in results[:3]])
+                    rag_prompt = f"""
+You are an assistant. Answer the following question using only the provided documents.
 
-                embedding = get_gemini_embedding(user_query)
-                vector_str = "[" + ",".join(map(str, embedding)) + "]"
-                semantic_query = f"{{!knn f=content_embedding topK=10}}{vector_str}"
-                st.success("✅ Semantic Vector Query:")
-                st.code(semantic_query)
+Question: {user_query}
 
-                hybrid_query = f"{keyword_query} AND {semantic_query}"
-                st.success("✅ Hybrid Query:")
-                st.code(hybrid_query)
+Documents:
+{context}
 
-                results = solr.search(hybrid_query)
-                scored_docs = []
-                for doc in results:
-                    doc_text = f"{doc.get('title', '')} {doc.get('content_text', '')}"
-                    score = score_with_gemini(user_query, doc_text)
-                    if score > 0.6:
-                        filtered_doc = {field: doc.get(field, "") for field in solr_fields}
-                        filtered_doc["score"] = score
-                        scored_docs.append(filtered_doc)
+Answer:
+""".strip()
 
-                scored_docs.sort(key=lambda x: x["score"], reverse=True)
-                results = scored_docs
+                    response = client.chat.completions.create(
+                        model=AZURE_CHAT_MODEL,
+                        messages=[{"role": "user", "content": rag_prompt}],
+                        temperature=0.3
+                    )
+                    rag_answer = response.choices[0].message.content.strip()
+                    st.markdown("### 🤖 LLM Answer:")
+                    st.write(rag_answer)
 
             st.markdown(f"### 📄 Found {len(results)} result(s):")
             if results:
